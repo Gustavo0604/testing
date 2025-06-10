@@ -389,17 +389,19 @@ async def run_all():
     bot_task = asyncio.create_task(main_loop())
     await asyncio.gather(web_task, bot_task)
 
-if __name__=='__main__':
-    p=argparse.ArgumentParser()
-    p.add_argument('--start',action='store_true')
-    args=p.parse_args()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser("Advanced Crypto Bot")
+    parser.add_argument('--start', action='store_true', help='Start bot + dashboard')
+    args = parser.parse_args()
     if args.start:
         try:
-            asyncio.run(run_all())
+-           asyncio.run(main_loop())
++           asyncio.run(run_all())
         except KeyboardInterrupt:
-            logger.info("Stopped by user")
+            logger.info("Bot stopped by user")
         except Exception as e:
-            logger.exception(f"Error: {e}")
+            logger.exception(f"Unexpected error: {e}")
             send_slack_alert(f"Bot crashed: {e}")
     else:
-        print("Use --start to run the bot")
+        print("Use --start to run the bot and web dashboard")
+
