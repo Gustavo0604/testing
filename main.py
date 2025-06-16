@@ -50,6 +50,7 @@ class Config:
     SLACK_WEBHOOK_URL        = os.getenv("SLACK_WEBHOOK_URL", "")
     WEB_PORT                 = int(os.getenv("PORT", "8000"))
 
+
 def setup_logging():
     logger = logging.getLogger("StaticBot")
     logger.setLevel(logging.DEBUG)
@@ -88,6 +89,7 @@ async def safe_fetch_ohlcv(exchange, symbol, timeframe, limit):
         logger.warning(f"fetch_ohlcv failed: {e}")
         return None
 
+
 def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["rsi"] = RSIIndicator(df["close"], window=14).rsi()
@@ -102,6 +104,7 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df["oc_change"] = (df["close"] - df["open"]) / df["open"]
     df.dropna(inplace=True)
     return df
+
 
 def prepare_ml_data(df: pd.DataFrame):
     df = df.copy()
@@ -120,6 +123,7 @@ def hyperopt_objective(params):
     cv = xgb.cv(params, dtrain, num_boost_round=50, nfold=3,
                 metrics={"auc"}, as_pandas=True, seed=42)
     return {"loss": -cv["test-auc-mean"].iloc[-1], "status": STATUS_OK}
+
 
 def optimize_hyperparams(X, y):
     space = {
@@ -185,11 +189,11 @@ class AsyncTrader:
                 trade_events.append({"timestamp": datetime.now(timezone.utc).isoformat(), "side":"buy",  "price":price})
                 return {"side":"buy","amount":amount,"price":price}
             else:
-                self.balances[base]  -= amount
-                self.balances[quote] += cost
+                self.balances[base] -= amount
+                self.balances[quote]+= cost
                 self.position = self.balances[base]
                 logger.info(f"[SIM] SELL {amount:.6f} BTC @ {price:.2f} -> USDT: {self.balances[quote]:.2f}")
-                trade_events.append({"timestamp": datetime.now(timezone.utc).isoformat(), "side":"sell", "price":price})
+                trade_events.append({"timestamp": datetime.now(timezone.utc).isoformat(), "side":"sell","price":price})
                 return {"side":"sell","amount":amount,"price":price,"buy_price":self.last_buy_price}
 
         try:
@@ -207,13 +211,8 @@ candle_data  = deque(maxlen=60)
 trade_events = []
 
 async def dashboard_handler(request):
-    html = """
-<!DOCTYPE html><html><head><title>Bot Dashboard</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial"></script>
-...
-"""
-    return web.Response(text=html, content_type="text/html")
+    # ... (mesmo HTML de antes)
+    return web.Response(text="...", content_type="text/html")
 
 async def data_handler(request):
     return web.json_response({"candles": list(candle_data), "trades": trade_events})
@@ -242,11 +241,11 @@ class Dashboard:
     def render(self, equity, pnl, wins, losses, open_pos):
         tbl = Table(expand=True)
         for k,v in [
-            ("Equity",    f"${equity:,.2f}"),
-            ("P&L",       f"${pnl:,.2f}"),
-            ("Wins",      str(wins)),
-            ("Losses",    str(losses)),
-            ("Open Pos",  str(open_pos))
+            ("Equity",   f"${equity:,.2f}"),
+            ("P&L",      f"${pnl:,.2f}"),
+            ("Wins",     str(wins)),
+            ("Losses",   str(losses)),
+            ("Open Pos", str(open_pos))
         ]:
             tbl.add_row(k, v)
         self.layout["hdr"].update(Panel("[b]Advanced Crypto Bot Dashboard[/b]"))
@@ -264,7 +263,7 @@ async def main_loop():
     trader = AsyncTrader(Config.SIMULATE_MODE, Config.INITIAL_CAPITAL)
     last_trade_time = datetime.now(timezone.utc) - timedelta(minutes=Config.COOLDOWN_MINUTES)
 
-    # fetch inicial e treino único
+    # setup inicial e treino único
     df0 = await safe_fetch_ohlcv(exchange, Config.SYMBOL, Config.TIMEFRAME, Config.LOOKBACK)
     df0 = preprocess(df0)
     X0, y0 = prepare_ml_data(df0)
@@ -284,6 +283,7 @@ async def main_loop():
     wins = losses = 0
     equity = Config.INITIAL_CAPITAL
     pnl = 0.0
+    itr = 0
     dash = Dashboard()
 
     with Live(console=console, refresh_per_second=1) as live:
@@ -309,12 +309,10 @@ async def main_loop():
             feats = last[["rsi","macd","macd_sig","bb_high","bb_low",
                           "atr","hl_range","oc_change"]].values.reshape(1, -1)
 
-            # predições estáticas
             prob_xgb = xgb_model.predict(xgb.DMatrix(feats))[0]
             prob_sgd = sgd_model.predict_proba(feats)[0][1]
             avg_prob = (prob_xgb + prob_sgd) / 2.0
 
-            # cooldown
             now = datetime.now(timezone.utc)
             can_trade = (now - last_trade_time).total_seconds() >= Config.COOLDOWN_MINUTES * 60
 
@@ -327,7 +325,6 @@ async def main_loop():
                 elif avg_prob < 1 - Config.SIGNAL_THRESHOLD:
                     sig = -1
 
-                # stop‐loss ATR
                 if trader.position > 0:
                     stop_price = trader.last_buy_price - 2 * last["atr"]
                     if trader.last_price < stop_price:
@@ -335,7 +332,6 @@ async def main_loop():
                         last_trade_time = now
                         sig = 0
 
-                # filtro de volatilidade
                 vola = df["oc_change"].rolling(20).std().iloc[-1]
                 size = calculate_position_size(
                     equity, trader.last_price, Config.MAX_POSITION_RISK, last["atr"]
@@ -343,7 +339,6 @@ async def main_loop():
                 if vola and vola > Config.MAX_VOLATILITY:
                     size *= Config.VOLATILITY_SIZE_FACTOR
 
-                # executar sinal
                 if sig == 1 and trader.position == 0:
                     order = await trader.place_order("buy", size)
                     last_trade_time = now
@@ -351,7 +346,6 @@ async def main_loop():
                     order = await trader.place_order("sell", trader.position)
                     last_trade_time = now
 
-            # pós‐venda
             if order and order.get("side") == "sell":
                 buy_p  = order["buy_price"]
                 sell_p = order["price"]
@@ -359,7 +353,6 @@ async def main_loop():
                 wins  += label
                 losses+= 1 - label
 
-            # atualizar equity & pnl
             equity = (
                 trader.balances["USDT"] + trader.balances["BTC"] * trader.last_price
                 if Config.SIMULATE_MODE
@@ -367,8 +360,10 @@ async def main_loop():
             )
             pnl = equity - Config.INITIAL_CAPITAL
 
-            live.update(dash.render(equity, pnl, wins, losses, int(trader.position>0)))
+            itr += 1
+            logger.info(f"[Loop {itr}] Equity=${equity:,.2f}  PnL=${pnl:,.2f}  Wins={wins} Losses={losses} OpenPos={int(trader.position>0)}")
 
+            live.update(dash.render(equity, pnl, wins, losses, int(trader.position>0)))
             await asyncio.sleep(60)
 
 # -------------------------------------------------------------------------
@@ -381,15 +376,3 @@ async def run_all():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Static Crypto Bot")
-    parser.add_argument("--start", action="store_true", help="Start bot + dashboard")
-    args = parser.parse_args()
-    if args.start:
-        try:
-            asyncio.run(run_all())
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user")
-        except Exception as e:
-            logger.exception(f"Unexpected error: {e}")
-            send_slack_alert(f"Bot crashed: {e}")
-    else:
-        print("Use --start to run the bot and web dashboard")
