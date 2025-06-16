@@ -14,6 +14,7 @@ import ccxt.async_support as ccxt
 import numpy as np
 import pandas as pd
 from datetime import datetime, timezone, timedelta
+from collections import deque
 from rich.console import Console
 from rich.table import Table
 from rich.live import Live
@@ -40,15 +41,14 @@ class Config:
     MAX_POSITION_RISK        = 0.02
     FULL_MODEL_ROUNDS        = 100
     SIGNAL_THRESHOLD         = 0.55
-    SAFE_MODE_LOSS_THRESHOLD = 0.005  # 0.5% drawdown
-    SAFE_MODE_COOLDOWN       = 15     # minutes
+    SAFE_MODE_LOSS_THRESHOLD = 0.005   # 0.5% drawdown
+    SAFE_MODE_COOLDOWN       = 15      # minutes
     COOLDOWN_MINUTES         = 3
-    MAX_VOLATILITY           = 0.02   # 2% std of returns
+    MAX_VOLATILITY           = 0.02    # 2% std of returns
     VOLATILITY_SIZE_FACTOR   = 0.5
     LOG_FILE                 = "bot.log"
     SLACK_WEBHOOK_URL        = os.getenv("SLACK_WEBHOOK_URL", "")
     WEB_PORT                 = int(os.getenv("PORT", "8000"))
-
 
 def setup_logging():
     logger = logging.getLogger("StaticBot")
@@ -88,7 +88,6 @@ async def safe_fetch_ohlcv(exchange, symbol, timeframe, limit):
         logger.warning(f"fetch_ohlcv failed: {e}")
         return None
 
-
 def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["rsi"] = RSIIndicator(df["close"], window=14).rsi()
@@ -104,7 +103,6 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df.dropna(inplace=True)
     return df
 
-
 def prepare_ml_data(df: pd.DataFrame):
     df = df.copy()
     df["future_close"] = df["close"].shift(-1)
@@ -116,14 +114,12 @@ def prepare_ml_data(df: pd.DataFrame):
 # -------------------------------------------------------------------------
 # 3. HYPERPARAMETER OPTIMIZATION (ONE-TIME)
 # -------------------------------------------------------------------------
-
 def hyperopt_objective(params):
     X, y = hyperopt_objective.data
     dtrain = xgb.DMatrix(X, label=y)
     cv = xgb.cv(params, dtrain, num_boost_round=50, nfold=3,
                 metrics={"auc"}, as_pandas=True, seed=42)
     return {"loss": -cv["test-auc-mean"].iloc[-1], "status": STATUS_OK}
-
 
 def optimize_hyperparams(X, y):
     space = {
@@ -151,17 +147,17 @@ def calculate_position_size(equity, price, risk_per_trade, atr):
     return min(size_by_risk, max_size)
 
 # -------------------------------------------------------------------------
-# 5. ASYNC TRADER w/ SIMULATION
+# 5. ASYNC TRADER w/ SIMULAÇÃO
 # -------------------------------------------------------------------------
 class AsyncTrader:
     def __init__(self, simulate, initial_capital):
-        self.simulate = simulate
-        self.exchange = ccxt.binance({"enableRateLimit": True})
+        self.simulate      = simulate
+        self.exchange      = ccxt.binance({"enableRateLimit": True})
         self.exchange.set_sandbox_mode(True)
-        base, quote = Config.SYMBOL.split("/")
-        self.balances = {quote: initial_capital, base: 0.0}
-        self.position = 0
-        self.last_price = None
+        base, quote       = Config.SYMBOL.split("/")
+        self.balances     = {quote: initial_capital, base: 0.0}
+        self.position     = 0
+        self.last_price   = None
         self.last_buy_price = None
 
     async def update_last_price(self):
@@ -186,12 +182,14 @@ class AsyncTrader:
                 self.position = self.balances[base]
                 self.last_buy_price = price
                 logger.info(f"[SIM] BUY  {amount:.6f} BTC @ {price:.2f} -> USDT: {self.balances[quote]:.2f}")
+                trade_events.append({"timestamp": datetime.now(timezone.utc).isoformat(), "side":"buy",  "price":price})
                 return {"side":"buy","amount":amount,"price":price}
             else:
                 self.balances[base]  -= amount
                 self.balances[quote] += cost
                 self.position = self.balances[base]
                 logger.info(f"[SIM] SELL {amount:.6f} BTC @ {price:.2f} -> USDT: {self.balances[quote]:.2f}")
+                trade_events.append({"timestamp": datetime.now(timezone.utc).isoformat(), "side":"sell", "price":price})
                 return {"side":"sell","amount":amount,"price":price,"buy_price":self.last_buy_price}
 
         try:
@@ -202,47 +200,20 @@ class AsyncTrader:
             logger.error(f"Order error: {e}")
             return None
 
-    async def close(self):
-        await self.exchange.close()
-
 # -------------------------------------------------------------------------
-# 6. DASHBOARD HANDLERS
+# 6. DASHBOARD & SERVIDOR WEB
 # -------------------------------------------------------------------------
-candle_data = deque(maxlen=60)
+candle_data  = deque(maxlen=60)
 trade_events = []
 
 async def dashboard_handler(request):
-    return web.Response(text="""
+    html = """
 <!DOCTYPE html><html><head><title>Bot Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial"></script>
-</head><body>
-<canvas id="chart" width="800" height="400"></canvas>
-<script>
-async function load() {
-  const resp = await fetch('/data'); const json = await resp.json();
-  const candles = json.candles.map(c=>({x:new Date(c.timestamp),o:c.open,h:c.high,l:c.low,c:c.close}));
-  const buys   = json.trades.filter(t=>t.side==='buy').map(t=>({x:new Date(t.timestamp),y:t.price}));
-  const sells  = json.trades.filter(t=>t.side==='sell').map(t=>({x:new Date(t.timestamp),y:t.price}));
-  window.ch = new Chart(document.getElementById('chart').getContext('2d'),{
-    type:'candlestick',data:{datasets:[
-      {label:'Price',data:candles},
-      {label:'Buys', type:'scatter', data:buys,  backgroundColor:'green'},
-      {label:'Sells',type:'scatter', data:sells, backgroundColor:'red'}
-    ]},options:{scales:{x:{type:'time'}}}
-  });
-}
-async function refresh(){
-  const resp = await fetch('/data'), json = await resp.json();
-  window.ch.data.datasets[0].data = json.candles.map(c=>({x:new Date(c.timestamp),o:c.open,h:c.high,l:c.low,c:c.close}));
-  window.ch.data.datasets[1].data = json.trades.filter(t=>t.side==='buy').map(t=>({x:new Date(t.timestamp),y:t.price}));
-  window.ch.data.datasets[2].data = json.trades.filter(t=>t.side==='sell').map(t=>({x:new Date(t.timestamp),y:t.price}));
-  window.ch.update();
-}
-load(); setInterval(refresh,5000);
-</script>
-</body></html>
-""", content_type="text/html")
+...
+"""
+    return web.Response(text=html, content_type="text/html")
 
 async def data_handler(request):
     return web.json_response({"candles": list(candle_data), "trades": trade_events})
@@ -257,9 +228,6 @@ async def start_web_dashboard():
     await site.start()
     logger.info(f"Web dashboard running on port {Config.WEB_PORT}")
 
-# -------------------------------------------------------------------------
-# 7. DASHBOARD COM RICH
-# -------------------------------------------------------------------------
 class Dashboard:
     def __init__(self):
         layout = Layout()
@@ -271,125 +239,140 @@ class Dashboard:
         layout["main"].split_row(Layout(name="left"), Layout(name="right"))
         self.layout = layout
 
-    def render(self, equity, pnl, open_pos):
+    def render(self, equity, pnl, wins, losses, open_pos):
         tbl = Table(expand=True)
-        tbl.add_row("Equity", f"${equity:,.2f}")
-        tbl.add_row("P&L", f"${pnl:,.2f}")
-        tbl.add_row("Open Pos", str(open_pos))
-        self.layout["hdr"].update(Panel("[b]Static Crypto Bot[/b]"))
+        for k,v in [
+            ("Equity",    f"${equity:,.2f}"),
+            ("P&L",       f"${pnl:,.2f}"),
+            ("Wins",      str(wins)),
+            ("Losses",    str(losses)),
+            ("Open Pos",  str(open_pos))
+        ]:
+            tbl.add_row(k, v)
+        self.layout["hdr"].update(Panel("[b]Advanced Crypto Bot Dashboard[/b]"))
         self.layout["left"].update(tbl)
         self.layout["right"].update(Panel(f"Last Update:\n{datetime.now(timezone.utc).isoformat()}"))
         self.layout["ftr"].update(Panel("[green]Running...[/green]"))
         return self.layout
 
 # -------------------------------------------------------------------------
-# 8. MAIN LOOP (no learning after init)
+# 7. LOOP PRINCIPAL
 # -------------------------------------------------------------------------
 async def main_loop():
     exchange = ccxt.binance({"enableRateLimit": True})
     exchange.set_sandbox_mode(True)
     trader = AsyncTrader(Config.SIMULATE_MODE, Config.INITIAL_CAPITAL)
+    last_trade_time = datetime.now(timezone.utc) - timedelta(minutes=Config.COOLDOWN_MINUTES)
 
-    # Initial model training
+    # fetch inicial e treino único
     df0 = await safe_fetch_ohlcv(exchange, Config.SYMBOL, Config.TIMEFRAME, Config.LOOKBACK)
     df0 = preprocess(df0)
     X0, y0 = prepare_ml_data(df0)
-
     best = optimize_hyperparams(X0, y0)
     xgb_params = {
-        "eta": float(best["eta"]),
-        "max_depth": int(best["md"]),
-        "subsample": float(best["ss"]),
+        "eta":           float(best["eta"]),
+        "max_depth":     int(best["md"]),
+        "subsample":     float(best["ss"]),
         "colsample_bytree": float(best["cb"]),
-        "objective": "binary:logistic",
-        "eval_metric": "auc"
+        "objective":     "binary:logistic",
+        "eval_metric":   "auc"
     }
     xgb_model = xgb.train(xgb_params, xgb.DMatrix(X0, label=y0), num_boost_round=Config.FULL_MODEL_ROUNDS)
-
     sgd_model = SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3)
-    sgd_model.fit(X0, y0)
+    sgd_model.partial_fit(X0, y0, classes=[0,1])
 
-    last_trade_time = datetime.now(timezone.utc) - timedelta(minutes=Config.COOLDOWN_MINUTES)
+    wins = losses = 0
     equity = Config.INITIAL_CAPITAL
     pnl = 0.0
     dash = Dashboard()
 
-    async with exchange:
-        async with trader.exchange:
-            with Live(console=console, refresh_per_second=1) as live:
-                while True:
-                    await trader.update_last_price()
-                    df = await safe_fetch_ohlcv(trader.exchange, Config.SYMBOL, Config.TIMEFRAME, 60)
-                    if df is None:
-                        await asyncio.sleep(5)
-                        continue
-                    df = preprocess(df)
+    with Live(console=console, refresh_per_second=1) as live:
+        while True:
+            await trader.update_last_price()
+            df = await safe_fetch_ohlcv(trader.exchange, Config.SYMBOL, Config.TIMEFRAME, 60)
+            if df is None:
+                await asyncio.sleep(5)
+                continue
+            df = preprocess(df)
 
-                    candle_data.clear()
-                    for ts, row in df.iterrows():
-                        candle_data.append({
-                            "timestamp": ts.isoformat(),
-                            "open": row["open"],
-                            "high": row["high"],
-                            "low": row["low"],
-                            "close": row["close"]
-                        })
+            candle_data.clear()
+            for ts, row in df.iterrows():
+                candle_data.append({
+                    "timestamp": ts.isoformat(),
+                    "open":      row["open"],
+                    "high":      row["high"],
+                    "low":       row["low"],
+                    "close":     row["close"]
+                })
 
-                    last = df.iloc[-1]
-                    feats = last[["rsi","macd","macd_sig","bb_high","bb_low","atr","hl_range","oc_change"]].values.reshape(1,-1)
+            last = df.iloc[-1]
+            feats = last[["rsi","macd","macd_sig","bb_high","bb_low",
+                          "atr","hl_range","oc_change"]].values.reshape(1, -1)
 
-                    prob_xgb = xgb_model.predict(xgb.DMatrix(feats))[0]
-                    prob_sgd = sgd_model.predict_proba(feats)[0][1]
-                    avg_prob = (prob_xgb + prob_sgd) / 2.0
+            # predições estáticas
+            prob_xgb = xgb_model.predict(xgb.DMatrix(feats))[0]
+            prob_sgd = sgd_model.predict_proba(feats)[0][1]
+            avg_prob = (prob_xgb + prob_sgd) / 2.0
 
-                    now = datetime.now(timezone.utc)
-                    can_trade = (now - last_trade_time).total_seconds() >= Config.COOLDOWN_MINUTES*60
+            # cooldown
+            now = datetime.now(timezone.utc)
+            can_trade = (now - last_trade_time).total_seconds() >= Config.COOLDOWN_MINUTES * 60
 
-                    sig = 0
-                    order = None
-                    if can_trade:
-                        if avg_prob > Config.SIGNAL_THRESHOLD:
-                            sig = 1
-                        elif avg_prob < 1 - Config.SIGNAL_THRESHOLD:
-                            sig = -1
+            sig = 0
+            order = None
 
-                        # Stop-loss by ATR
-                        if trader.position > 0:
-                            stop_price = trader.last_buy_price - 2 * last["atr"]
-                            if trader.last_price < stop_price:
-                                order = await trader.place_order("sell", trader.position)
-                                last_trade_time = now
-                                sig = 0
+            if can_trade:
+                if avg_prob > Config.SIGNAL_THRESHOLD:
+                    sig = 1
+                elif avg_prob < 1 - Config.SIGNAL_THRESHOLD:
+                    sig = -1
 
-                        # Volatility filter
-                        vola = df["oc_change"].rolling(20).std().iloc[-1]
-                        size = calculate_position_size(equity, trader.last_price,
-                                                       Config.MAX_POSITION_RISK, last["atr"])
-                        if vola and vola > Config.MAX_VOLATILITY:
-                            size *= Config.VOLATILITY_SIZE_FACTOR
+                # stop‐loss ATR
+                if trader.position > 0:
+                    stop_price = trader.last_buy_price - 2 * last["atr"]
+                    if trader.last_price < stop_price:
+                        order = await trader.place_order("sell", trader.position)
+                        last_trade_time = now
+                        sig = 0
 
-                        if sig == 1 and trader.position == 0:
-                            order = await trader.place_order("buy", size)
-                            last_trade_time = now
-                        elif sig == -1 and trader.position > 0:
-                            order = await trader.place_order("sell", trader.position)
-                            last_trade_time = now
+                # filtro de volatilidade
+                vola = df["oc_change"].rolling(20).std().iloc[-1]
+                size = calculate_position_size(
+                    equity, trader.last_price, Config.MAX_POSITION_RISK, last["atr"]
+                )
+                if vola and vola > Config.MAX_VOLATILITY:
+                    size *= Config.VOLATILITY_SIZE_FACTOR
 
-                    # Update equity & pnl
-                    equity = (trader.balances["USDT"] + trader.balances["BTC"]*trader.last_price
-                              if Config.SIMULATE_MODE
-                              else Config.INITIAL_CAPITAL + trader.position*trader.last_price)
-                    pnl = equity - Config.INITIAL_CAPITAL
+                # executar sinal
+                if sig == 1 and trader.position == 0:
+                    order = await trader.place_order("buy", size)
+                    last_trade_time = now
+                elif sig == -1 and trader.position > 0:
+                    order = await trader.place_order("sell", trader.position)
+                    last_trade_time = now
 
-                    live.update(dash.render(equity, pnl, int(trader.position>0)))
-                    await asyncio.sleep(60)
+            # pós‐venda
+            if order and order.get("side") == "sell":
+                buy_p  = order["buy_price"]
+                sell_p = order["price"]
+                label  = int(sell_p > buy_p)
+                wins  += label
+                losses+= 1 - label
 
-    await trader.exchange.close()
-    await exchange.close()
-    logger.info("Exchanges closed.")
+            # atualizar equity & pnl
+            equity = (
+                trader.balances["USDT"] + trader.balances["BTC"] * trader.last_price
+                if Config.SIMULATE_MODE
+                else Config.INITIAL_CAPITAL + trader.position * trader.last_price
+            )
+            pnl = equity - Config.INITIAL_CAPITAL
+
+            live.update(dash.render(equity, pnl, wins, losses, int(trader.position>0)))
+
+            await asyncio.sleep(60)
 
 # -------------------------------------------------------------------------
-# 9. EXECUÇÃO
+# 8. RUN BOTH BOT AND WEB DASHBOARD
 # -------------------------------------------------------------------------
 async def run_all():
     web_task = asyncio.create_task(start_web_dashboard())
