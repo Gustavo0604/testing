@@ -2,8 +2,8 @@
 
 """
 Static Crypto Trading Bot
-No incremental learning or retraining: same model from start to finish
-Automatically starts on execution (no --start flag needed)
+No incremental learning or retraining: mesmo modelo do início ao fim
+Inicia automaticamente na execução (sem flag --start)
 """
 
 import os
@@ -151,18 +151,19 @@ def calculate_position_size(equity, price, risk_per_trade, atr):
     max_size = equity / price
     return min(size_by_risk, max_size)
 
-# -------------------------------------------------------------------------\# 5. ASYNC TRADER w/ SIMULAÇÃO
+# -------------------------------------------------------------------------
+# 5. ASYNC TRADER w/ SIMULAÇÃO
 # -------------------------------------------------------------------------
 class AsyncTrader:
     def __init__(self, simulate, initial_capital):
-        self.simulate      = simulate
-        self.exchange      = ccxt.binance({"enableRateLimit": True})
+        self.simulate       = simulate
+        self.exchange       = ccxt.binance({"enableRateLimit": True})
         self.exchange.set_sandbox_mode(True)
-        base, quote       = Config.SYMBOL.split("/")
-        self.balances     = {quote: initial_capital, base: 0.0}
-        self.position     = 0
-        self.last_price   = None
-        self.last_buy_price = None
+        base, quote        = Config.SYMBOL.split("/")
+        self.balances      = {quote: initial_capital, base: 0.0}
+        self.position      = 0
+        self.last_price    = None
+        self.last_buy_price= None
 
     async def update_last_price(self):
         try:
@@ -189,8 +190,8 @@ class AsyncTrader:
                 trade_events.append({"timestamp": datetime.now(timezone.utc).isoformat(), "side":"buy",  "price":price})
                 return {"side":"buy","amount":amount,"price":price}
             else:
-                self.balances[base] -= amount
-                self.balances[quote]+= cost
+                self.balances[base]  -= amount
+                self.balances[quote] += cost
                 self.position = self.balances[base]
                 logger.info(f"[SIM] SELL {amount:.6f} BTC @ {price:.2f} -> USDT: {self.balances[quote]:.2f}")
                 trade_events.append({"timestamp": datetime.now(timezone.utc).isoformat(), "side":"sell","price":price})
@@ -262,17 +263,18 @@ async def main_loop():
     trader = AsyncTrader(Config.SIMULATE_MODE, Config.INITIAL_CAPITAL)
     last_trade_time = datetime.now(timezone.utc) - timedelta(minutes=Config.COOLDOWN_MINUTES)
 
+    # coleta inicial e treino estático
     df0 = await safe_fetch_ohlcv(exchange, Config.SYMBOL, Config.TIMEFRAME, Config.LOOKBACK)
     df0 = preprocess(df0)
     X0, y0 = prepare_ml_data(df0)
     best = optimize_hyperparams(X0, y0)
     xgb_params = {
-        "eta":           float(best["eta"]),
-        "max_depth":     int(best["md"]),
-        "subsample":     float(best["ss"]),
-        "colsample_bytree": float(best["cb"]),
-        "objective":     "binary:logistic",
-        "eval_metric":   "auc"
+        "eta":             float(best["eta"]),
+        "max_depth":       int(best["md"]),
+        "subsample":       float(best["ss"]),
+        "colsample_bytree":float(best["cb"]),
+        "objective":       "binary:logistic",
+        "eval_metric":     "auc"
     }
     logger.info("Starting static model training...")
     xgb_model = xgb.train(xgb_params, xgb.DMatrix(X0, label=y0), num_boost_round=Config.FULL_MODEL_ROUNDS)
@@ -324,6 +326,7 @@ async def main_loop():
                 elif avg_prob < 1 - Config.SIGNAL_THRESHOLD:
                     sig = -1
 
+                # stop-loss por ATR
                 if trader.position > 0:
                     stop_price = trader.last_buy_price - 2 * last["atr"]
                     if trader.last_price < stop_price:
@@ -332,9 +335,8 @@ async def main_loop():
                         sig = 0
 
                 vola = df["oc_change"].rolling(20).std().iloc[-1]
-                size = calculate_position_size(
-                    equity, trader.last_price, Config.MAX_POSITION_RISK, last["atr"]
-                )
+                size = calculate_position_size(equity, trader.last_price,
+                                               Config.MAX_POSITION_RISK, last["atr"])
                 if vola and vola > Config.MAX_VOLATILITY:
                     size *= Config.VOLATILITY_SIZE_FACTOR
 
@@ -351,26 +353,30 @@ async def main_loop():
                 label  = int(sell_p > buy_p)
                 wins  += label
                 losses+= 1 - label
+                pnl_change = sell_p - buy_p
 
-            equity = (
-                trader.balances["USDT"] + trader.balances["BTC"] * trader.last_price
-                if Config.SIMULATE_MODE
-                else Config.INITIAL_CAPITAL + trader.position * trader.last_price
-            )
+            equity = (trader.balances["USDT"] + trader.balances["BTC"] * trader.last_price
+                      if Config.SIMULATE_MODE
+                      else Config.INITIAL_CAPITAL + trader.position * trader.last_price)
             pnl = equity - Config.INITIAL_CAPITAL
 
+            # Log de cada iteração
             itr += 1
             logger.info(f"[Loop {itr}] Equity=${equity:,.2f}  PnL=${pnl:,.2f}  Wins={wins} Losses={losses} OpenPos={int(trader.position>0)}")
 
             live.update(dash.render(equity, pnl, wins, losses, int(trader.position>0)))
+
             await asyncio.sleep(60)
 
 # -------------------------------------------------------------------------
-# 8. RUN BOTH BOT AND WEB DASHBOARD (auto-start)
+# 8. ENTRYPOINT
 # -------------------------------------------------------------------------
+async def run_all():
+    await asyncio.gather(start_web_dashboard(), main_loop())
+
 if __name__ == "__main__":
     try:
-        asyncio.run(asyncio.gather(start_web_dashboard(), main_loop()))
+        asyncio.run(run_all())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
