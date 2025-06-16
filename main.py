@@ -3,13 +3,13 @@
 """
 Static Crypto Trading Bot
 No incremental learning or retraining: same model from start to finish
+Automatically starts on execution (no --start flag needed)
 """
 
 import os
 import sys
 import asyncio
 import logging
-import argparse
 import ccxt.async_support as ccxt
 import numpy as np
 import pandas as pd
@@ -67,6 +67,7 @@ def setup_logging():
 
 logger = setup_logging()
 console = Console()
+
 
 def send_slack_alert(msg: str):
     if Config.SLACK_WEBHOOK_URL:
@@ -150,8 +151,7 @@ def calculate_position_size(equity, price, risk_per_trade, atr):
     max_size = equity / price
     return min(size_by_risk, max_size)
 
-# -------------------------------------------------------------------------
-# 5. ASYNC TRADER w/ SIMULAÇÃO
+# -------------------------------------------------------------------------\# 5. ASYNC TRADER w/ SIMULAÇÃO
 # -------------------------------------------------------------------------
 class AsyncTrader:
     def __init__(self, simulate, initial_capital):
@@ -211,8 +211,7 @@ candle_data  = deque(maxlen=60)
 trade_events = []
 
 async def dashboard_handler(request):
-    # ... (mesmo HTML de antes)
-    return web.Response(text="...", content_type="text/html")
+    return web.Response(text="""<!DOCTYPE html><html><head><title>Bot Dashboard</title>...""", content_type="text/html")
 
 async def data_handler(request):
     return web.json_response({"candles": list(candle_data), "trades": trade_events})
@@ -248,7 +247,7 @@ class Dashboard:
             ("Open Pos", str(open_pos))
         ]:
             tbl.add_row(k, v)
-        self.layout["hdr"].update(Panel("[b]Advanced Crypto Bot Dashboard[/b]"))
+        self.layout["hdr"].update(Panel("[b]Static Crypto Bot Dashboard[/b]"))
         self.layout["left"].update(tbl)
         self.layout["right"].update(Panel(f"Last Update:\n{datetime.now(timezone.utc).isoformat()}"))
         self.layout["ftr"].update(Panel("[green]Running...[/green]"))
@@ -263,7 +262,6 @@ async def main_loop():
     trader = AsyncTrader(Config.SIMULATE_MODE, Config.INITIAL_CAPITAL)
     last_trade_time = datetime.now(timezone.utc) - timedelta(minutes=Config.COOLDOWN_MINUTES)
 
-    # setup inicial e treino único
     df0 = await safe_fetch_ohlcv(exchange, Config.SYMBOL, Config.TIMEFRAME, Config.LOOKBACK)
     df0 = preprocess(df0)
     X0, y0 = prepare_ml_data(df0)
@@ -276,6 +274,7 @@ async def main_loop():
         "objective":     "binary:logistic",
         "eval_metric":   "auc"
     }
+    logger.info("Starting static model training...")
     xgb_model = xgb.train(xgb_params, xgb.DMatrix(X0, label=y0), num_boost_round=Config.FULL_MODEL_ROUNDS)
     sgd_model = SGDClassifier(loss="log_loss", max_iter=1000, tol=1e-3)
     sgd_model.partial_fit(X0, y0, classes=[0,1])
@@ -367,12 +366,13 @@ async def main_loop():
             await asyncio.sleep(60)
 
 # -------------------------------------------------------------------------
-# 8. RUN BOTH BOT AND WEB DASHBOARD
+# 8. RUN BOTH BOT AND WEB DASHBOARD (auto-start)
 # -------------------------------------------------------------------------
-async def run_all():
-    web_task = asyncio.create_task(start_web_dashboard())
-    bot_task = asyncio.create_task(main_loop())
-    await asyncio.gather(web_task, bot_task)
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("Static Crypto Bot")
+    try:
+        asyncio.run(asyncio.gather(start_web_dashboard(), main_loop()))
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.exception(f"Unexpected error: {e}")
+        send_slack_alert(f"Bot crashed: {e}")
